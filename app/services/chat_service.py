@@ -1,6 +1,7 @@
 """
 AI Health Assistant — powered by Google Gemini REST API.
 Falls back to local responses when Gemini quota is exceeded.
+Handles emotional, symptom, and human worried questions.
 """
 from __future__ import annotations
 import logging
@@ -14,7 +15,7 @@ from app.schemas.chat import ChatMessage
 logger = logging.getLogger("yolocheck.chat")
 
 SYSTEM_PROMPT = (
-    "You are YOLOCheck's AI Health Assistant — a friendly, empathetic, and knowledgeable "
+    "You are YOLOCheck's AI Health Assistant — a warm, empathetic, and knowledgeable "
     "skin-health educator. Your role is strictly educational.\n\n"
     "STRICT RULES — NEVER VIOLATE THESE:\n"
     "1. You MUST NOT diagnose any skin condition, disease, or cancer.\n"
@@ -30,8 +31,23 @@ SYSTEM_PROMPT = (
     "- For HIGH-RISK scan results, strongly encourage seeing a dermatologist promptly.\n"
     "- Answer general educational questions about moles, skin health, and UV protection.\n"
     "- Explain the difference between benign and malignant moles.\n"
-    "- Explain skin diseases like melanoma, eczema, psoriasis, carcinoma, rosacea.\n\n"
-    "TONE: Warm, reassuring, and clear. Avoid medical jargon.\n"
+    "- Explain skin diseases like melanoma, eczema, psoriasis, carcinoma, rosacea.\n"
+    "- Provide emotional support and reassurance to worried users.\n"
+    "- Answer questions about symptoms like itching, bleeding, changing moles.\n"
+    "- Help users understand what to expect at a dermatologist appointment.\n"
+    "- Answer questions about anxiety, fear, and worry about skin cancer.\n"
+    "- Answer ANY question related to skin health, moles, or skin diseases.\n"
+    "- If the user uploads a report, summarize and explain it clearly.\n\n"
+    "REPORT HANDLING:\n"
+    "- If the message contains [YOLOCHECK REPORT CONTENT], read it carefully.\n"
+    "- Summarize: classification, risk level, confidence, ABCD scores, TDS.\n"
+    "- Explain what the scores mean in simple language.\n"
+    "- Give appropriate next steps based on the risk level.\n\n"
+    "EMOTIONAL SUPPORT:\n"
+    "- Be warm, calm, and reassuring when users express fear or anxiety.\n"
+    "- Acknowledge their feelings before providing information.\n"
+    "- Never dismiss concerns — treat every question with care and respect.\n\n"
+    "TONE: Warm, reassuring, human, and clear. Avoid medical jargon.\n"
     "Always end every response with:\n"
     "⚠️ Reminder: This is AI-generated educational information only — not a medical diagnosis. "
     "Please consult a qualified dermatologist for professional advice."
@@ -48,342 +64,433 @@ GEMINI_REST_URL = (
 )
 
 
-# ── Local fallback answers ────────────────────────────────────────────────────
+def _call_gemini(message: str, system: str, max_tokens: int = 1024) -> Optional[str]:
+    """Call Gemini API with a given prompt. Returns None if unavailable."""
+    settings = get_settings()
+    url = GEMINI_REST_URL.format(
+        model=settings.gemini_model,
+        api_key=settings.gemini_api_key,
+    )
+    payload = {
+        "contents": [{"parts": [{"text": f"{system}\n\n{message}"}], "role": "user"}],
+        "generationConfig": {"temperature": 0.8, "maxOutputTokens": max_tokens},
+    }
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(url, json=payload)
+            response.raise_for_status()
+            data  = response.json()
+            reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if "not a medical diagnosis" not in reply.lower():
+                reply = f"{reply}\n\n{DISCLAIMER}"
+            return reply
+    except Exception as exc:
+        logger.warning("Gemini call failed: %s", exc)
+        return None
+
+
+def _extract_report_data(message: str) -> dict:
+    """Extract key data from uploaded report text."""
+    data      = {}
+    msg_lower = message.lower()
+
+    if "benign"    in msg_lower: data["classification"] = "BENIGN"
+    elif "malignant" in msg_lower: data["classification"] = "MALIGNANT"
+
+    if "high risk"     in msg_lower: data["risk"] = "High"
+    elif "moderate risk" in msg_lower: data["risk"] = "Moderate"
+    elif "low risk"      in msg_lower: data["risk"] = "Low"
+
+    import re
+    conf = re.search(r"confidence[:\s]+(\d+)%", msg_lower)
+    if conf: data["confidence"] = conf.group(1)
+
+    tds = re.search(r"total[:\s]+(\d+\.?\d*)\s*/\s*12", msg_lower)
+    if tds: data["tds"] = tds.group(1)
+
+    return data
+
 
 def _local_fallback(message: str) -> str:
-    """Local answers when Gemini quota is exceeded."""
+    """
+    Local answers when Gemini quota is exceeded.
+    Covers predefined topics first, then tries Gemini with a simpler prompt,
+    then falls back to a helpful generic response.
+    """
     q = message.lower()
 
-    if ("benign" in q and "malignant" in q) or "difference" in q:
+    # ── Report summarization ───────────────────────────────────────────────────
+    if "[yolocheck report content]" in q or any(w in q for w in [
+        "summarize", "summary", "summarise",
+        "what does my report say", "explain my report",
+        "read my report", "what is in my report"
+    ]):
+        report_data    = _extract_report_data(message)
+        classification = report_data.get("classification", "Unknown")
+        risk           = report_data.get("risk", "Unknown")
+        confidence     = report_data.get("confidence", "Unknown")
+        tds            = report_data.get("tds", "Unknown")
+        next_steps = {
+            "High":     "See a dermatologist **within 1 week**.",
+            "Moderate": "Schedule a dermatologist appointment **within 2–4 weeks**.",
+            "Low":      "Continue monthly self-checks and annual professional skin checks.",
+        }.get(risk, "Consult a dermatologist for professional evaluation.")
         return (
-            "**Benign vs Malignant Moles:**\n\n"
-            "• **Benign** moles are non-cancerous. They are usually uniform in color, "
-            "have smooth borders, are symmetric, and stay the same over time. "
-            "They pose no immediate health risk.\n\n"
-            "• **Malignant** moles are cancerous or pre-cancerous. They may be asymmetric, "
-            "have irregular borders, show multiple colors, or grow larger than 6mm. "
-            "They require immediate medical attention.\n\n"
-            "**Malignant is more dangerous** — it means the cells are abnormal and can "
-            "spread to other parts of the body if untreated."
+            f"**Your YOLOCheck Report Summary:**\n\n"
+            f"• **Classification:** {classification}\n"
+            f"• **Risk Level:** {risk} Risk\n"
+            f"• **AI Confidence:** {confidence}%\n"
+            f"• **Total Dermoscopy Score:** {tds} / 12\n\n"
+            f"**What this means:**\n"
+            f"Your mole was classified as **{classification}** with **{risk} Risk**.\n\n"
+            f"**Next Steps:** {next_steps}\n\n"
+            f"Remember: This is an AI screening result — only a qualified dermatologist "
+            f"can give you a definitive diagnosis."
+        )
+
+    if any(w in q for w in ["risk level", "what is my risk", "my risk"]):
+        return (
+            "**Risk Levels Explained:**\n\n"
+            "• **Low Risk** — Features within normal range. Continue routine monitoring.\n"
+            "• **Moderate Risk** — Some concerning features. See a dermatologist within 2–4 weeks.\n"
+            "• **High Risk** — Significant features detected. See a dermatologist within 1 week.\n\n"
+            "Check your result screen for your specific risk level."
+        )
+
+    if any(w in q for w in ["what should i do next", "next steps",
+                              "based on my results", "what to do"]):
+        return (
+            "**Your Next Steps:**\n\n"
+            "• **High Risk** → Dermatologist within 1 week\n"
+            "• **Moderate Risk** → Appointment within 2–4 weeks\n"
+            "• **Low Risk** → Monthly self-checks + annual professional check\n\n"
+            "Also: take photos of the mole to track changes and use SPF 50+ daily."
+        )
+
+    if any(w in q for w in ["explain my abcd", "what are my scores", "abcd scores from",
+                              "abcd score", "my abcd"]):
+        return (
+            "**Your ABCD Scores (each rated 0–3):**\n\n"
+            "• **A (Asymmetry)** — Is one half different from the other?\n"
+            "• **B (Border)** — Are the edges irregular or ragged?\n"
+            "• **C (Color)** — Are there multiple colors present?\n"
+            "• **D (Diameter)** — Is it larger than 6mm?\n\n"
+            "**Total Dermoscopy Score:** 0–4 Low · 5–8 Moderate · 9–12 High Risk"
+        )
+
+    if any(w in q for w in ["classification", "what does classification mean",
+                              "benign or malignant result"]):
+        return (
+            "**Classification:**\n\n"
+            "• **BENIGN** — AI detected characteristics of a harmless mole\n"
+            "• **MALIGNANT** — AI detected potentially concerning characteristics\n\n"
+            "This is NOT a diagnosis — only a dermatologist can confirm through "
+            "proper clinical examination."
+        )
+
+    # ── Emotional questions ────────────────────────────────────────────────────
+    if any(w in q for w in ["scared", "afraid", "terrified", "fear",
+                              "worried", "worry", "anxious", "anxiety", "panic", "nervous"]):
+        return (
+            "I completely understand — it's completely normal to feel scared. 💙\n\n"
+            "Here's what's important:\n"
+            "• **Most moles are completely harmless** — vast majority are benign\n"
+            "• Even concerning results are almost always treatable when caught early\n"
+            "• YOLOCheck is a screening tool — it flags things for review, not a diagnosis\n\n"
+            "The bravest thing you can do is **book a dermatologist appointment**. "
+            "You are not alone. 💙"
+        )
+
+    if any(w in q for w in ["cancer", "do i have cancer", "is it cancer"]):
+        return (
+            "I understand why you're worried. I cannot tell you whether you have cancer — "
+            "only a qualified dermatologist can determine that.\n\n"
+            "What I can tell you:\n"
+            "• The vast majority of moles are **not cancerous**\n"
+            "• Melanoma detected early has a **98%+ survival rate**\n"
+            "• YOLOCheck's result is a screening indicator, not a diagnosis\n\n"
+            "Please book a dermatologist appointment — early detection saves lives. 💙"
+        )
+
+    if any(w in q for w in ["i am scared", "i'm scared", "i am worried",
+                              "i'm worried", "so scared", "very scared"]):
+        return (
+            "I hear you, and feeling scared is completely understandable. 💙\n\n"
+            "Please take a deep breath. YOLOCheck is not a diagnosis — it's an awareness tool. "
+            "Many people with high risk scores go on to have completely benign results.\n\n"
+            "The most important step: **see a dermatologist**. You are doing the right thing. 🌟"
+        )
+
+    if any(w in q for w in ["what should i do", "what do i do now", "help me", "what now"]):
+        return (
+            "**Here's exactly what to do:**\n\n"
+            "1. **Don't panic** — most skin changes are benign and treatable\n"
+            "2. **Book a dermatologist** — High Risk: 1 week, Moderate: 2–4 weeks, Low: annual\n"
+            "3. **Document the mole** — take clear photos in good lighting\n"
+            "4. **Monitor for changes** — growth, bleeding, itching, color change\n"
+            "5. **Protect your skin** — SPF 50+ sunscreen daily\n\n"
+            "You are taking the right steps by using YOLOCheck."
+        )
+
+    if any(w in q for w in ["stress", "mental health", "depressed", "can't sleep", "overthinking"]):
+        return (
+            "I hear you — health anxiety is very real. 💙\n\n"
+            "The single best thing you can do for your mental health right now is to "
+            "**book a dermatologist appointment**. Once you have a professional opinion, "
+            "you will feel so much better.\n\n"
+            "If anxiety is seriously affecting your daily life, please also speak with "
+            "a mental health professional."
+        )
+
+    if any(w in q for w in ["embarrassed", "shy", "ashamed", "self conscious"]):
+        return (
+            "There is absolutely nothing to be embarrassed about. 💙\n\n"
+            "Dermatologists see patients with all kinds of skin concerns every day. "
+            "They are there to help, not to judge. Your health matters."
+        )
+
+    if any(w in q for w in ["can't afford", "no money", "expensive", "cost", "free"]):
+        return (
+            "**Accessing Skin Care on a Budget:**\n\n"
+            "• Public hospitals — free or low-cost dermatology clinics\n"
+            "• Medical colleges — teaching hospitals offer free consultations\n"
+            "• Telemedicine — online consultations are often cheaper\n\n"
+            "In Pakistan: PIMS, Jinnah Hospital, Aga Khan Hospital have dermatology departments.\n"
+            "Many government hospitals offer subsidized consultations."
+        )
+
+    # ── Symptom questions ──────────────────────────────────────────────────────
+    if any(w in q for w in ["itching", "itchy", "itch", "scratching"]):
+        return (
+            "**Itching Around a Mole:**\n\n"
+            "Common causes (usually harmless): dry skin, irritation from clothing/soap.\n\n"
+            "See a doctor if:\n"
+            "• Itching persists more than 2 weeks\n"
+            "• The mole has also changed in appearance\n"
+            "• The mole is also bleeding\n\n"
+            "Don't scratch — book a dermatologist appointment to be safe."
+        )
+
+    if any(w in q for w in ["bleeding", "bleed", "blood", "oozing"]):
+        return (
+            "**A Bleeding Mole — Take This Seriously:**\n\n"
+            "1. Clean gently with mild soap and water\n"
+            "2. Do NOT pick or scratch it\n"
+            "3. Take a clear photo for reference\n"
+            "4. Book a dermatologist appointment **within this week**\n\n"
+            "Don't ignore a bleeding mole."
+        )
+
+    if any(w in q for w in ["changing", "changed", "growing", "getting bigger"]):
+        return (
+            "**A Changing Mole:**\n\n"
+            "Any mole that changes in size, shape, or color should be evaluated.\n\n"
+            "• Take photos now and compare monthly\n"
+            "• Rapidly changing → dermatologist within 1 week\n"
+            "• Slowly changing → appointment within 2–4 weeks"
+        )
+
+    if any(w in q for w in ["painful", "pain", "hurts", "sore", "tender"]):
+        return (
+            "**A Painful Mole:**\n\n"
+            "Could be from trauma, infection, or rarely rapid growth.\n"
+            "See a doctor if pain persists more than 2 weeks or mole is also changing."
+        )
+
+    if any(w in q for w in ["new mole", "new spot", "appeared", "suddenly appeared"]):
+        return (
+            "**A New Mole:**\n\n"
+            "Usually harmless. More concerning if:\n"
+            "• Appeared suddenly and grew quickly\n"
+            "• Looks different from your other moles\n"
+            "• Has irregular borders, multiple colors, or larger than 6mm\n\n"
+            "Use YOLOCheck to scan it and see a dermatologist if it looks unusual."
+        )
+
+    if any(w in q for w in ["family history", "my family", "parent had",
+                              "mother had", "father had", "hereditary", "genetic"]):
+        return (
+            "**Family History of Skin Cancer:**\n\n"
+            "Increases your risk but does NOT mean you will develop it.\n\n"
+            "• Full body skin check every 6–12 months\n"
+            "• Monthly self-examinations\n"
+            "• SPF 50+ every day\n"
+            "• No tanning beds\n\n"
+            "Tell your dermatologist about your family history."
+        )
+
+    if any(w in q for w in ["how long", "how much time", "will it spread", "fast", "quickly"]):
+        return (
+            "**How Fast Does Skin Cancer Progress?**\n\n"
+            "• Basal cell carcinoma — very slow, rarely spreads\n"
+            "• Squamous cell carcinoma — moderate, can spread if untreated\n"
+            "• Melanoma — can spread quickly — early detection is critical\n\n"
+            "Don't wait — book a dermatologist appointment now."
+        )
+
+    # ── Knowledge questions ────────────────────────────────────────────────────
+    if ("benign" in q and "malignant" in q) or ("difference" in q and "mole" in q):
+        return (
+            "**Benign vs Malignant:**\n\n"
+            "• **Benign** — non-cancerous, uniform, smooth, symmetric, stable\n"
+            "• **Malignant** — cancerous, asymmetric, irregular, multiple colors\n\n"
+            "Malignant can spread if untreated — early detection is key."
         )
     if "benign" in q:
         return (
-            "**What is a Benign Mole?**\n\n"
-            "A benign mole is a non-cancerous skin growth. Most people have 10–40 benign "
-            "moles. They are typically:\n"
-            "• Round or oval with smooth borders\n"
-            "• One uniform color (tan, brown, or black)\n"
-            "• Smaller than 6mm\n"
-            "• Symmetric — both halves look the same\n"
-            "• Stable — not changing over time\n\n"
-            "Benign moles generally don't require treatment but should be monitored regularly."
+            "**Benign Mole:**\n\n"
+            "Non-cancerous. Round/oval, smooth borders, one color, symmetric, stable.\n"
+            "Monitor regularly — generally no treatment needed."
         )
     if "malignant" in q:
         return (
-            "**What is a Malignant Mole?**\n\n"
-            "A malignant mole contains cancerous cells. The most serious type is melanoma. "
-            "Warning signs include:\n"
-            "• **Asymmetry** — one half doesn't match the other\n"
-            "• **Border** — edges are irregular or ragged\n"
-            "• **Color** — multiple shades of brown, black, red, or white\n"
-            "• **Diameter** — larger than 6mm\n"
-            "• **Evolution** — changing in size, shape, or color\n\n"
-            "If you notice these signs, see a dermatologist immediately."
-        )
-    if "dangerous" in q or "more dangerous" in q:
-        return (
-            "**Which is More Dangerous?**\n\n"
-            "**Malignant** is far more dangerous than benign.\n\n"
-            "• Benign moles are harmless and don't spread.\n"
-            "• Malignant moles (especially melanoma) can spread to lymph nodes and "
-            "other organs if not treated early.\n\n"
-            "Melanoma is the deadliest form of skin cancer but is highly treatable "
-            "when caught early. This is why early detection tools like YOLOCheck are important."
-        )
-    if "turn" in q or "become" in q:
-        return (
-            "**Can a Benign Mole Turn Malignant?**\n\n"
-            "Yes, although it is uncommon. Risk factors include:\n"
-            "• Excessive UV/sun exposure\n"
-            "• Family history of melanoma\n"
-            "• Having many moles (50+)\n"
-            "• Fair skin that burns easily\n"
-            "• Atypical or dysplastic moles\n\n"
-            "This is why regular self-examination and annual dermatologist visits are important."
+            "**Malignant Mole:**\n\n"
+            "Contains cancerous cells. Warning signs: asymmetry, irregular border, "
+            "multiple colors, diameter >6mm, changing over time.\n"
+            "See a dermatologist immediately if you notice these signs."
         )
     if "melanoma" in q:
         return (
-            "**What is Melanoma?**\n\n"
-            "Melanoma is the most serious type of skin cancer. It develops in melanocytes "
-            "(pigment-producing cells). Key facts:\n"
-            "• It can appear as a new mole or develop within an existing one\n"
-            "• It can spread to other organs if not caught early\n"
-            "• It is highly treatable when detected early (5-year survival rate >98%)\n"
-            "• Risk factors include UV exposure, fair skin, and family history\n\n"
-            "Early detection through YOLOCheck and regular dermatologist visits "
-            "is the best defense against melanoma."
+            "**Melanoma:**\n\n"
+            "Most serious skin cancer. 98%+ survival rate when detected early.\n"
+            "Risk factors: UV exposure, fair skin, family history.\n"
+            "Regular YOLOCheck scans and dermatologist visits are key."
         )
     if "basal" in q:
         return (
-            "**What is Basal Cell Carcinoma?**\n\n"
-            "Basal cell carcinoma (BCC) is the most common type of skin cancer. "
-            "It grows slowly and rarely spreads. It appears as:\n"
-            "• A pearly or waxy bump\n"
-            "• A flat, flesh-colored lesion\n"
-            "• A bleeding or scabbing sore that heals and returns\n\n"
-            "BCC is caused mainly by long-term UV exposure and is highly treatable "
-            "when caught early."
+            "**Basal Cell Carcinoma:**\n\n"
+            "Most common skin cancer. Grows slowly, rarely spreads.\n"
+            "Highly treatable when caught early."
         )
     if "squamous" in q:
         return (
-            "**What is Squamous Cell Carcinoma?**\n\n"
-            "Squamous cell carcinoma (SCC) is the second most common skin cancer. "
-            "It can spread if untreated. Signs include:\n"
-            "• A firm, red nodule\n"
-            "• A flat lesion with a scaly, crusted surface\n"
-            "• A new sore on an old scar\n\n"
-            "SCC is caused by UV exposure and is treatable when detected early."
+            "**Squamous Cell Carcinoma:**\n\n"
+            "Second most common. Can spread if untreated.\n"
+            "Treatable when detected early."
         )
     if "eczema" in q:
         return (
-            "**What is Eczema?**\n\n"
-            "Eczema (atopic dermatitis) is a chronic inflammatory skin condition causing:\n"
-            "• Dry, itchy, inflamed skin\n"
-            "• Red to brownish-gray patches\n"
-            "• Small, raised bumps that may weep fluid\n\n"
-            "It is not contagious or cancerous. It is managed with moisturizers "
-            "and avoiding triggers."
+            "**Eczema:**\n\n"
+            "Chronic inflammatory skin condition — dry, itchy, inflamed skin.\n"
+            "Not contagious or cancerous. Managed with moisturizers and avoiding triggers."
         )
     if "psoriasis" in q:
         return (
-            "**What is Psoriasis?**\n\n"
-            "Psoriasis is a chronic autoimmune condition causing rapid skin cell buildup. "
-            "Symptoms include:\n"
-            "• Red patches covered with thick, silvery scales\n"
-            "• Dry, cracked skin that may bleed\n"
-            "• Itching, burning, or soreness\n\n"
-            "It is not contagious. Treatment includes topical creams and light therapy."
+            "**Psoriasis:**\n\n"
+            "Chronic autoimmune condition — red patches with silvery scales.\n"
+            "Not contagious. Treatment: topical creams and light therapy."
         )
     if "rosacea" in q:
         return (
-            "**What is Rosacea?**\n\n"
-            "Rosacea is a chronic skin condition causing redness mainly on the face. "
-            "Symptoms include:\n"
-            "• Facial redness and flushing\n"
-            "• Visible blood vessels\n"
-            "• Swollen red bumps\n\n"
-            "Triggers include sun exposure, hot drinks, and stress. "
-            "It is manageable but not curable."
+            "**Rosacea:**\n\n"
+            "Facial redness and flushing. Triggers: sun, hot drinks, stress.\n"
+            "Manageable but not curable."
         )
     if "dermatitis" in q:
         return (
-            "**What is Dermatitis?**\n\n"
-            "Dermatitis is inflammation of the skin. Types include:\n"
-            "• **Contact dermatitis** — reaction to something touching the skin\n"
-            "• **Atopic dermatitis (eczema)** — chronic itchy inflammation\n"
-            "• **Seborrheic dermatitis** — flaky patches on oily areas\n\n"
-            "Treatment depends on the type but usually involves avoiding triggers "
-            "and using topical treatments."
+            "**Dermatitis:**\n\n"
+            "Skin inflammation. Types: contact, atopic (eczema), seborrheic.\n"
+            "Treatment: avoid triggers, topical treatments."
         )
     if "seborrheic" in q:
         return (
-            "**What is Seborrheic Keratosis?**\n\n"
-            "Seborrheic keratosis is a common non-cancerous skin growth. Features:\n"
-            "• Waxy, scaly, slightly raised appearance\n"
-            "• Light tan to black color\n"
-            "• Looks 'stuck on' the skin\n"
-            "• Usually appears after age 50\n\n"
-            "It is completely benign and requires no treatment unless irritated."
+            "**Seborrheic Keratosis:**\n\n"
+            "Common non-cancerous growth. Waxy, 'stuck on' appearance.\n"
+            "Completely benign — no treatment needed unless irritated."
         )
     if "abcd" in q:
         return (
-            "**The ABCD Rule of Dermoscopy:**\n\n"
-            "• **A — Asymmetry**: One half of the mole doesn't match the other\n"
-            "• **B — Border**: Edges are irregular, ragged, notched, or blurred\n"
-            "• **C — Color**: Variation in color (shades of brown, black, red, white)\n"
-            "• **D — Diameter**: Larger than 6mm (size of a pencil eraser)\n\n"
-            "YOLOCheck scores each 0–3 for a Total Dermoscopy Score:\n"
-            "• 0–4: Low Risk\n"
-            "• 5–8: Moderate Risk\n"
-            "• 9–12: High Risk"
-        )
-    if "asymmetry" in q:
-        return (
-            "**A — Asymmetry in the ABCD Rule:**\n\n"
-            "Asymmetry means one half of the mole does not mirror the other half. "
-            "A normal mole is symmetric — if you drew a line through the middle, "
-            "both halves would match.\n\n"
-            "YOLOCheck scores asymmetry 0–3:\n"
-            "• 0–1: Symmetric (reassuring)\n"
-            "• 2–3: Significant asymmetry (warrants evaluation)"
-        )
-    if "border" in q:
-        return (
-            "**B — Border in the ABCD Rule:**\n\n"
-            "Border refers to the edges of the mole. Benign moles have smooth, "
-            "well-defined borders. Concerning moles have:\n"
-            "• Irregular or ragged edges\n"
-            "• Notched or scalloped borders\n"
-            "• Poorly defined edges that fade into surrounding skin\n\n"
-            "YOLOCheck scores border irregularity 0–3."
-        )
-    if "color" in q:
-        return (
-            "**C — Color in the ABCD Rule:**\n\n"
-            "Color variation within a mole is a warning sign. Benign moles are "
-            "usually one uniform shade. Concerning moles may show:\n"
-            "• Multiple shades of brown or black\n"
-            "• Red, white, or blue areas\n"
-            "• Uneven pigmentation\n\n"
-            "YOLOCheck scores color variation 0–3."
-        )
-    if "diameter" in q:
-        return (
-            "**D — Diameter in the ABCD Rule:**\n\n"
-            "The clinical threshold for concerning diameter is 6mm — about the size "
-            "of a pencil eraser. Moles larger than this warrant evaluation.\n\n"
-            "However, some melanomas can be smaller than 6mm, so size alone is not "
-            "the only factor. YOLOCheck scores diameter 0–3 based on relative size."
+            "**The ABCD Rule:**\n\n"
+            "• A — Asymmetry\n• B — Border irregularity\n"
+            "• C — Color variation\n• D — Diameter >6mm\n\n"
+            "TDS: 0–4 Low · 5–8 Moderate · 9–12 High Risk"
         )
     if "high risk" in q:
         return (
-            "**High Risk Classification:**\n\n"
-            "A High Risk result means YOLOCheck detected significant ABCD features. "
-            "This does not mean you have cancer, but it strongly suggests you should "
-            "consult a board-certified dermatologist within 1 week for professional evaluation."
+            "**High Risk:** Significant ABCD features detected.\n"
+            "See a dermatologist within 1 week.\n"
+            "NOT a diagnosis — many high risk scans turn out benign after professional evaluation."
         )
     if "low risk" in q:
-        return (
-            "**Low Risk Classification:**\n\n"
-            "A Low Risk result means the mole's ABCD features are within normal ranges. "
-            "Continue monthly self-examinations, use SPF 50+ sunscreen daily, "
-            "and schedule annual professional skin checks."
-        )
+        return "**Low Risk:** Features within normal range. Monthly self-checks + annual professional check."
     if "moderate risk" in q:
-        return (
-            "**Moderate Risk Classification:**\n\n"
-            "Some features of potential concern were identified. Schedule a dermatology "
-            "appointment within 2–4 weeks and track any changes in size, shape, or color."
-        )
-    if "confidence" in q:
-        return (
-            "**Confidence Score:**\n\n"
-            "The confidence score shows how certain YOLOv11 is about its detection. "
-            "90% confidence means the model is 90% sure the detected region matches "
-            "the patterns it was trained on. Scores above 80% are generally reliable."
-        )
-    if "total" in q and "score" in q:
-        return (
-            "**Total Dermoscopy Score (TDS):**\n\n"
-            "The TDS is the sum of all four ABCD scores (each 0–3), giving a total of 0–12:\n"
-            "• **0–4**: Low Risk — features within normal range\n"
-            "• **5–8**: Moderate Risk — some concerning features\n"
-            "• **9–12**: High Risk — significant concerning features\n\n"
-            "Your score reflects the combined assessment of asymmetry, border, color, and diameter."
-        )
+        return "**Moderate Risk:** Some concerning features. Book dermatologist within 2–4 weeks."
     if "prevent" in q or "prevention" in q:
         return (
             "**Preventing Skin Cancer:**\n\n"
-            "• Apply SPF 50+ broad-spectrum sunscreen daily\n"
-            "• Avoid sun between 10am–4pm\n"
-            "• Wear protective clothing and wide-brimmed hats\n"
-            "• Never use tanning beds\n"
-            "• Perform monthly self-skin examinations\n"
-            "• Get annual professional skin checks\n"
-            "• Check moles using the ABCD rule regularly"
+            "• SPF 50+ sunscreen daily\n• Avoid sun 10am–4pm\n"
+            "• No tanning beds\n• Monthly self-checks\n• Annual dermatologist visits"
         )
     if "dermatologist" in q or "doctor" in q or "when should" in q:
         return (
             "**When to See a Dermatologist:**\n\n"
-            "• **Immediately** for High Risk results\n"
-            "• **Within 2–4 weeks** for Moderate Risk results\n"
-            "• **Annually** for routine skin checks\n"
-            "• **Any time** a mole changes, bleeds, itches, or looks unusual\n\n"
-            "Early detection is the most important factor in successful skin cancer treatment."
+            "• Immediately for High Risk\n• Within 2–4 weeks for Moderate Risk\n"
+            "• Annually for routine checks\n"
+            "• Any time a mole changes, bleeds, itches, or looks unusual"
         )
     if "spf" in q or "sunscreen" in q:
         return (
-            "**Sunscreen Recommendations:**\n\n"
-            "• Use **SPF 50+** broad-spectrum sunscreen\n"
-            "• Apply 15–30 minutes before sun exposure\n"
-            "• Reapply every 2 hours and after swimming\n"
-            "• Use on all exposed skin year-round\n\n"
-            "Sunscreen is the single most effective tool for preventing skin cancer."
+            "**Sunscreen:**\n\n"
+            "• SPF 50+ broad-spectrum\n• Apply 15–30 min before sun\n"
+            "• Reapply every 2 hours\n• Use year-round"
         )
-    if "uv" in q or "sun" in q:
-        return (
-            "**How UV Radiation Affects Skin:**\n\n"
-            "UV radiation damages DNA in skin cells, which can cause mutations leading "
-            "to skin cancer. There are two types:\n"
-            "• **UVA** — penetrates deeply, causes aging and DNA damage\n"
-            "• **UVB** — causes sunburn and is the main cause of skin cancer\n\n"
-            "Both types contribute to melanoma risk. Use broad-spectrum SPF 50+ to "
-            "block both UVA and UVB rays."
-        )
-    if "food" in q or "diet" in q:
-        return (
-            "**Foods That Help Skin Health:**\n\n"
-            "• **Tomatoes** — lycopene protects against UV damage\n"
-            "• **Green tea** — antioxidants reduce skin inflammation\n"
-            "• **Fatty fish** — omega-3s reduce inflammation\n"
-            "• **Carrots & sweet potatoes** — beta-carotene supports skin repair\n"
-            "• **Dark chocolate** — flavonoids improve skin hydration\n"
-            "• **Broccoli** — sulforaphane has anti-cancer properties\n\n"
-            "A balanced diet supports overall skin health but does not replace sunscreen."
-        )
-    if "check" in q or "self" in q or "examine" in q:
-        return (
-            "**How to Check Your Moles:**\n\n"
-            "Perform a self-examination monthly:\n"
-            "1. Use a full-length mirror in good lighting\n"
-            "2. Check your entire body including scalp, between toes, and under nails\n"
-            "3. Use a hand mirror for hard-to-see areas\n"
-            "4. Apply the ABCD rule to each mole\n"
-            "5. Take photos to track changes over time\n\n"
-            "See a dermatologist immediately if any mole changes suddenly."
-        )
-    if "yolo" in q or "how does" in q or "detect" in q:
+    if "yolo" in q or "how does" in q or ("detect" in q and "mole" in q):
         return (
             "**How YOLOv11 Detects Moles:**\n\n"
-            "YOLOv11 (You Only Look Once v11) is a real-time object detection neural network. "
-            "YOLOCheck's model was trained on thousands of dermoscopy images to:\n"
+            "YOLOv11 is a real-time neural network trained on dermoscopy images to:\n"
             "• Locate moles with precise bounding boxes\n"
-            "• Classify them as benign or malignant\n"
-            "• Provide a confidence score\n\n"
-            "The ABCD analysis is then performed on the detected region for additional "
-            "risk assessment."
+            "• Classify as benign or malignant\n"
+            "• Provide confidence scores\n\n"
+            "ABCD analysis is then performed for additional risk assessment."
         )
     if "hello" in q or "hi" in q or "hey" in q:
         return (
-            "Hello! I'm the YOLOCheck AI Health Assistant. I can help you understand:\n"
-            "• Your scan results (benign/malignant, risk level, ABCD scores)\n"
-            "• The difference between benign and malignant moles\n"
-            "• Skin diseases like melanoma, eczema, psoriasis\n"
-            "• When to see a dermatologist\n"
-            "• How to prevent skin cancer\n\n"
-            "What would you like to know?"
+            "Hello! I'm the YOLOCheck AI Health Assistant. 👋\n\n"
+            "Ask me anything about skin health — moles, symptoms, diseases, "
+            "your scan results, or even just how you're feeling. I'm here for you! 💙"
+        )
+    if "total" in q and "score" in q:
+        return (
+            "**Total Dermoscopy Score (TDS):**\n\n"
+            "Sum of ABCD scores (each 0–3), total 0–12:\n"
+            "• 0–4: Low Risk\n• 5–8: Moderate\n• 9–12: High Risk"
         )
 
+    # ── Unknown question — try Gemini with simpler prompt ─────────────────────
+    simple_system = (
+        "You are a friendly, warm skin health assistant. Answer questions about "
+        "skin health, moles, skin diseases, and emotional concerns in a clear, "
+        "educational, and empathetic way. Never diagnose. Always suggest seeing "
+        "a dermatologist for professional advice. Keep your answer concise and helpful."
+    )
+    gemini_reply = _call_gemini(message, simple_system, max_tokens=512)
+    if gemini_reply:
+        return gemini_reply
+
+    # ── Final fallback ─────────────────────────────────────────────────────────
     return (
-        "I can help you understand your YOLOCheck scan results, the ABCD dermoscopy rule, "
-        "the difference between benign and malignant moles, skin diseases like melanoma, "
-        "eczema, and psoriasis, and when to consult a dermatologist.\n\n"
-        "Please ask me a specific question about any of these topics!"
+        "I'm here to help with any skin health questions! 💙\n\n"
+        "You can ask me about:\n"
+        "• Moles — benign vs malignant, ABCD rule, symptoms\n"
+        "• Skin diseases — melanoma, eczema, psoriasis, rosacea\n"
+        "• Your scan results — risk level, confidence, ABCD scores\n"
+        "• Emotional support — if you're worried or scared\n"
+        "• Prevention — sunscreen, self-checks, when to see a doctor\n\n"
+        "What would you like to know?"
     )
 
-
-# ── Scan context ──────────────────────────────────────────────────────────────
 
 def _fetch_scan_context(scan_id: str) -> str:
     try:
         supabase = get_supabase()
-        scan = supabase.table("scans").select("*").eq("id", scan_id).single().execute()
+        scan     = supabase.table("scans").select("*").eq("id", scan_id).single().execute()
         if not scan.data:
             return ""
-        s = scan.data
+        s    = scan.data
         dets = (
             supabase.table("detections")
-            .select("mole_id, risk_level, abcd_asymmetry, abcd_border, abcd_color, abcd_diameter, abcd_total")
+            .select("mole_id, risk_level, label, abcd_asymmetry, abcd_border, "
+                    "abcd_color, abcd_diameter, abcd_total, confidence")
             .eq("scan_id", scan_id)
             .execute()
         )
@@ -393,7 +500,9 @@ def _fetch_scan_context(scan_id: str) -> str:
         ]
         for d in (dets.data or []):
             lines.append(
-                f"  • {d['mole_id']}: Risk={d['risk_level']}, "
+                f"  • {d['mole_id']}: Label={d.get('label','unknown')}, "
+                f"Risk={d['risk_level']}, "
+                f"Confidence={round(d.get('confidence', 0) * 100)}%, "
                 f"ABCD total={d['abcd_total']} "
                 f"(A={d['abcd_asymmetry']}, B={d['abcd_border']}, "
                 f"C={d['abcd_color']}, D={d['abcd_diameter']})"
@@ -403,8 +512,6 @@ def _fetch_scan_context(scan_id: str) -> str:
         logger.warning("Could not load scan context: %s", exc)
         return ""
 
-
-# ── Main chat function ────────────────────────────────────────────────────────
 
 def chat(
     message: str,
@@ -439,16 +546,8 @@ def chat(
     )
 
     payload = {
-        "contents": [
-            {
-                "parts": [{"text": full_prompt}],
-                "role": "user",
-            }
-        ],
-        "generationConfig": {
-            "temperature":     0.7,
-            "maxOutputTokens": 1024,
-        },
+        "contents": [{"parts": [{"text": full_prompt}], "role": "user"}],
+        "generationConfig": {"temperature": 0.8, "maxOutputTokens": 1024},
     }
 
     try:
@@ -457,13 +556,10 @@ def chat(
             response.raise_for_status()
             data  = response.json()
             reply = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
             if "not a medical diagnosis" not in reply.lower():
                 reply = f"{reply}\n\n{DISCLAIMER}"
-
             return reply
 
     except Exception as exc:
-        # Gemini unavailable — use local fallback
         logger.warning("Gemini unavailable (%s) — using local fallback.", exc)
         return _local_fallback(message) + "\n\n" + DISCLAIMER
