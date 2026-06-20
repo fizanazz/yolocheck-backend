@@ -1,7 +1,6 @@
 """
 Application configuration — loaded from environment variables / .env file.
 """
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 import json
@@ -25,6 +24,8 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://localhost:5173",
         "https://yolocheck-frontend.vercel.app",
+        "https://yolocheck-frontend-git-main-fizanazz1.vercel.app",
+        "https://yolocheck-frontend-mj9voywtm-fizanazz1.vercel.app",
     ]
 
     # ── Supabase ───────────────────────────────────────────────────────────────
@@ -48,20 +49,16 @@ class Settings(BaseSettings):
     def parse_origins(cls, v: Any) -> list[str]:
         if isinstance(v, str):
             v = v.strip()
-            # wildcard
             if v == "*":
                 return ["*"]
-            # JSON array format: ["url1","url2"]
             if v.startswith("["):
                 try:
                     return json.loads(v)
                 except Exception:
                     pass
-            # comma-separated: url1,url2
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
 
 
-@lru_cache
 def get_settings() -> Settings:
     return Settings()
